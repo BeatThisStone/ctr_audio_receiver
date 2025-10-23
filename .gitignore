@@ -50,3 +50,8 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# CTR Specifics
+*.3dsx
+*.lst
+*.smdh
