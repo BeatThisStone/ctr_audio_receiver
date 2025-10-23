@@ -1,6 +1,8 @@
 #include "3ds/ndsp/ndsp.h"
+#include "3ds/services/hid.h"
 #include "3ds/svc.h"
 #include "3ds/types.h"
+#include "netinet/in.h"
 #include <3ds.h>
 #include <arpa/inet.h>
 #include <malloc.h>
@@ -12,7 +14,7 @@
 
 #define PORT 9999
 #define BUF_SIZE 4096
-#define NUM_BUFFERS 3
+#define NUM_BUFFERS 6
 
 int main()
 {
@@ -38,10 +40,7 @@ int main()
     int listenSock = socket(AF_INET, SOCK_STREAM, 0);
     if (listenSock < 0) {
         printf("socket() failed\n");
-        socExit();
-        free(socBuffer);
-        gfxExit();
-        return 1;
+        goto exit_soc;
     }
 
     struct sockaddr_in addr = { 0 };
@@ -51,33 +50,28 @@ int main()
 
     if (bind(listenSock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         printf("bind() failed\n");
-        closesocket(listenSock);
-        socExit();
-        free(socBuffer);
-        gfxExit();
-        return 1;
+        goto exit_socket;
     }
 
     if (listen(listenSock, 1) < 0) {
         printf("listen() failed\n");
-        closesocket(listenSock);
-        socExit();
-        free(socBuffer);
-        gfxExit();
-        return 1;
+        goto exit_socket;
     }
 
     printf("Waiting for client connection...\n");
     int clientSock = accept(listenSock, NULL, NULL);
     if (clientSock < 0) {
         printf("accept() failed\n");
-        closesocket(listenSock);
-        socExit();
-        free(socBuffer);
-        gfxExit();
-        return 1;
+        goto exit_socket;
     }
+
     printf("Client connected!\n");
+
+    // Configure socket
+    // int flag = 1;
+    // setsockopt(clientSock, IPPROTO_TCP, TCP_, &flag, sizeof(flag));
+    int recvBufSize = 64 * 1024;
+    setsockopt(clientSock, SOL_SOCKET, SO_RCVBUF, &recvBufSize, sizeof(recvBufSize));
 
     // Allocate audio buffers
     u8* audioBufs[NUM_BUFFERS];
@@ -87,12 +81,7 @@ int main()
             printf("Failed to allocate audio buffer %d\n", i);
             for (int j = 0; j < i; j++)
                 linearFree(audioBufs[j]);
-            closesocket(clientSock);
-            closesocket(listenSock);
-            socExit();
-            free(socBuffer);
-            gfxExit();
-            return 1;
+            goto exit_client;
         }
         memset(audioBufs[i], 0, BUF_SIZE);
     }
@@ -105,72 +94,66 @@ int main()
     ndspChnSetRate(0, 22050.0f);
     ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 
-    int submittedSeq = 0;
+    ndspWaveBuf waveBufs[NUM_BUFFERS];
+    memset(waveBufs, 0, sizeof(waveBufs));
 
     printf("Receiving audio...\n");
 
-    ndspWaveBuf waveBuf;
-    waveBuf.status = NDSP_WBUF_DONE;
+    int submittedSeq = 0;
 
     while (aptMainLoop()) {
-        int playingSeq = ndspChnGetWaveBufSeq(0);
-        int buffersQueued = submittedSeq - playingSeq;
-
-        // Wait for a free buffer slot
-        while (buffersQueued >= NUM_BUFFERS) {
-            playingSeq = ndspChnGetWaveBufSeq(0);
-            buffersQueued = submittedSeq - playingSeq;
-        }
-
-        int bufIndex = submittedSeq % NUM_BUFFERS;
-
-        // Read exactly BUF_SIZE bytes
-        ssize_t received = 0;
-        while (received < BUF_SIZE) {
-            ssize_t ret = recv(clientSock, audioBufs[bufIndex] + received, BUF_SIZE - received, 0);
-            if (ret == 0) {
-                printf("Connection closed by client\n");
-                goto cleanup;
-            }
-            if (ret < 0) {
-                printf("recv() error\n");
-                goto cleanup;
-            }
-            received += ret;
-        }
-        // svcSleepThread(1 * 1000 * 1000 * 1000ULL);
-        while (waveBuf.status != NDSP_WBUF_DONE) {
-            svcSleepThread(1 * 10 * 1000ULL);
-        }
-
-        memset(&waveBuf, 0, sizeof(waveBuf));
-        waveBuf.data_vaddr = audioBufs[bufIndex];
-        waveBuf.nsamples = BUF_SIZE / 4; // 4 bytes per sample frame (stereo 16-bit)
-        waveBuf.looping = false;
-        waveBuf.status = NDSP_WBUF_DONE;
-
-        DSP_FlushDataCache(audioBufs[bufIndex], BUF_SIZE);
-        ndspChnWaveBufAdd(0, &waveBuf);
-
-        submittedSeq++;
-
         hidScanInput();
         if (hidKeysDown() & KEY_START)
             break;
+
+        int queued = submittedSeq - ndspChnGetWaveBufSeq(0);
+        if (queued >= NUM_BUFFERS)
+            continue;
+
+        int bufIndex = submittedSeq % NUM_BUFFERS;
+        ndspWaveBuf* wb = &waveBufs[bufIndex];
+
+        // Wait until NDSP is done with this buffer
+        if (wb->status != NDSP_WBUF_DONE && wb->status != 0) {
+            svcSleepThread(1 * 1000 * 1000ULL); // ~1ms
+            continue;
+        }
+
+        // Receive exactly BUF_SIZE bytes
+        ssize_t ret = recv(clientSock, audioBufs[bufIndex], BUF_SIZE, MSG_WAITALL);
+        if (ret <= 0) {
+            printf("Connection closed or recv() failed\n");
+            break;
+        }
+
+        // Prepare and queue wave buffer
+        DSP_FlushDataCache(audioBufs[bufIndex], BUF_SIZE);
+        memset(wb, 0, sizeof(*wb));
+        wb->data_vaddr = audioBufs[bufIndex];
+        wb->nsamples = BUF_SIZE / 4; // stereo 16-bit = 4 bytes per frame
+        wb->looping = false;
+
+        ndspChnWaveBufAdd(0, wb);
+        submittedSeq++;
+
+        if (submittedSeq % NUM_BUFFERS == 0)
+            submittedSeq = 0;
     }
 
-cleanup:
     printf("Cleaning up...\n");
 
+    // --- CLEANUP ---
     ndspExit();
 
-    for (int i = 0; i < NUM_BUFFERS; i++) {
+    for (int i = 0; i < NUM_BUFFERS; i++)
         if (audioBufs[i])
             linearFree(audioBufs[i]);
-    }
 
+exit_client:
     closesocket(clientSock);
+exit_socket:
     closesocket(listenSock);
+exit_soc:
     socExit();
     free(socBuffer);
     gfxExit();
